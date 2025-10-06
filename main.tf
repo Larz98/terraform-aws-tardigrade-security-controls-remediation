@@ -128,7 +128,7 @@ resource "aws_cloudwatch_event_rule" "ec2_19_trigger" {
           "Status": ["FAILED"]
         },
         "ProductFields": {
-          "controlId": ["EC2.19"]
+          "GeneratorId": ["security-control/EC2.19"]
         }
       }
     }
