@@ -11,8 +11,8 @@ variable "sns_notification_email" {
   }
 }
 
-variable "dry_run" {
-  description = "If true, enables Dry Run Mode"
+variable "lambda_debug" {
+  description = "If true, increases logging verbosity from INFO to DEBUG"
   type        = bool
   default     = false
 }
@@ -29,7 +29,7 @@ variable "ec2_19_enabled" {
 variable "ec2_19_exception_bool_tag" {
   description = "AWS TAG to look for on alerting Security Group; if Tag exists and value set to true, then skip remediation"
   type        = string
-  default     = "internetFacing"
+  default     = "Exception:Public-Access"
 
   validation {
     condition = alltrue([

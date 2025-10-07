@@ -58,9 +58,8 @@ resource "aws_iam_policy" "remediation_lambda_policy" {
         Effect   = "Allow",
         Resource = aws_sns_topic.security_alert.arn
       },
-      # Used By: EC2.19
       {
-        Sid      = "AllowEC2SecurityGroupModification",
+        Sid      = "EC2-19_AllowEC2SecurityGroupModification",
         Action   = [
           "ec2:AuthorizeSecurityGroupIngress",
           "ec2:RevokeSecurityGroupIngress",
@@ -103,7 +102,7 @@ resource "aws_lambda_function" "remediator" {
     variables = {
       # GLOBAL
       SNS_TOPIC_ARN             = aws_sns_topic.security_alert.arn
-      DRY_RUN                   = var.dry_run ? "true" : "false"
+      DEBUG                     = var.debug ? "true" : "false"
       # EC2.19
       EC2_19_EXCEPTION_TAG      = var.ec2_19_exception_bool_tag
       EC2_19_REMEDIATION_ACTION = local.ec2_19_effective_action

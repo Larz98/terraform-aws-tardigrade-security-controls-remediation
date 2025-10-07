@@ -11,12 +11,12 @@ Remediations:
             https://docs.aws.amazon.com/console/securityhub/EC2.19/remediation
 
 """
-
 import os
+import sys
 import json
 import logging
-from typing import Dict, Any, List, Tuple, Callable
-import functools
+import argparse
+from typing import Dict, Any, List, Tuple
 import boto3
 
 
@@ -24,9 +24,6 @@ import boto3
 #              CONSTANTS               #
 #########################################
 TRUTHY_TAG_VALUES = ['true', 'yes', '1']
-REMEDIATION_DESCRIPTION = 'Modified by Security Hub Lambda Remediation'
-
-# EC2.19
 EC2_19_OFFENDING_CIDRS = ['0.0.0.0/0', '::/0']
 
 
@@ -34,9 +31,8 @@ EC2_19_OFFENDING_CIDRS = ['0.0.0.0/0', '::/0']
 #        ENVIRONMENT VARIABLES         #
 #########################################
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
-DRY_RUN_ENABLED = os.environ.get('DRY_RUN', 'false').lower() in TRUTHY_TAG_VALUES
+DEBUG = os.environ.get('DEBUG', 'false').lower() in TRUTHY_TAG_VALUES
 
-# EC2.19
 EC2_19_EXCEPTION_TAG_KEY = os.environ.get('EC2_19_EXCEPTION_TAG')
 EC2_19_REMEDIATION_ACTION = os.environ.get('EC2_19_REMEDIATION_ACTION')
 EC2_19_REPLACEMENT_CIDRS = [
@@ -49,43 +45,37 @@ EC2_19_REPLACEMENT_CIDRS = [
 #            INITIAL SETUP             #
 #########################################
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+if DEBUG:
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-SNS_CLIENT = boto3.client('sns')  # SNS is region-agnostic for publishing
 
+SNS_CLIENT = boto3.client('sns')
+STS_CLIENT = boto3.client('sts')
 
-#########################################
-#           DECORATOR FUNCTION          #
-#########################################
-def dry_run_wrapper(func: Callable) -> Callable:
-    """
-    Decorator that intercepts a function call if DRY_RUN_ENABLED is True,
-    logging the intent instead of executing the function.
-    """
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs) -> Any:
-        func_name = func.__name__
-
-        positional_args = [repr(a) for a in args[1:]]
-        keyword_args = [f"{k}={repr(v)}" for k, v in kwargs.items()]
-
-        all_args = ", ".join(positional_args + keyword_args)
-
-        if DRY_RUN_ENABLED:
-            logger.warning("DRY-RUN: Would have called function '%s(%s)'. Execution skipped.", func_name, all_args)
-            if func_name in ['ec2_sg_remediate_update', 'ec2_sg_remediate_revoke']:
-                return True
-            return None
-
-        # If DRY_RUN is False, execute the original function
-        return func(*args, **kwargs)
-
-    return wrapper
+logger.info("RUN CONFIG: DEBUG:'%s', ACTTION:'%s', EX_TAG:'%s', CIDRs:'%s', SNS:'%s'", DEBUG,
+    EC2_19_REMEDIATION_ACTION, EC2_19_EXCEPTION_TAG_KEY, EC2_19_REPLACEMENT_CIDRS, SNS_TOPIC_ARN
+    )
 
 
 #########################################
 #          HELPER FUNCTIONS            #
 #########################################
+def get_aws_identity():
+    """Fetch and print the current AWS identity details."""
+    try:
+        identity = STS_CLIENT.get_caller_identity()
+        logger.info("Account ID: %s", identity['Account'])
+        logger.info("User ARN: %s", identity['Arn'])
+    except Exception as exc:
+        logger.exception("WARNING: Could not retrieve AWS identity. %s", exc)
+
+
 def get_details_from_finding(event: Dict[str, Any]) -> Tuple[str, str, str] | Tuple[None, None, None]:
     """
     Extracts Control ID, Security Group ID, and Region from the Security Hub finding event.
@@ -98,11 +88,9 @@ def get_details_from_finding(event: Dict[str, Any]) -> Tuple[str, str, str] | Tu
     """
     try:
         finding = event['detail']['findings'][0]
-        control_id = finding['ProductFields']['controlId']
-        resource = finding['Resources'][0]
-        # Extract SG ID from the resource ARN
-        sg_id = resource['Id'].split('/')[-1]
-        region = resource['Region']
+        control_id = finding['Compliance']['SecurityControlId']
+        sg_id = finding['Resources'][0]['Details']['AwsEc2SecurityGroup']['GroupId']
+        region = finding['Resources'][0]['Region']
 
         return control_id, sg_id, region
     except (KeyError, IndexError):
@@ -271,7 +259,6 @@ def ec2_sg_authorize_rule(ec2_client: boto3.client, sg_id: str, new_ip_permissio
         return False
 
 
-@dry_run_wrapper
 def ec2_sg_remediate_update(ec2_client: boto3.client, sg_id: str, rule: Dict[str, Any]) -> str:
     """
     Handles the UPDATE remediation action: replaces an offending rule with approved CIDRs.
@@ -285,9 +272,11 @@ def ec2_sg_remediate_update(ec2_client: boto3.client, sg_id: str, rule: Dict[str
         A string summarizing the UPDATE result (SUCCESS or FAILED).
     """
     if not EC2_19_REPLACEMENT_CIDRS:
-        error_msg = "UPDATE requested but replacement CIDRs are empty."
+        error_msg = "'UPDATE' requested but replacement CIDRs are empty."
         logger.error("SG %s: FAILED to authorize new rules: %s", sg_id, error_msg)
         return f"FAILED: {error_msg}"
+
+    rule_description = 'Rule created by EC2.19 Remediation Lambda'
 
     new_ip_permissions: List[Dict[str, Any]] = []
     for cidr in EC2_19_REPLACEMENT_CIDRS:
@@ -298,11 +287,11 @@ def ec2_sg_remediate_update(ec2_client: boto3.client, sg_id: str, rule: Dict[str
         }
         if ':' in cidr:  # IPv6
             permission['Ipv6Ranges'] = [
-                {'CidrIpv6': cidr, 'Description': REMEDIATION_DESCRIPTION}
+                {'CidrIpv6': cidr, 'Description': rule_description}
             ]
         else:  # IPv4
             permission['IpRanges'] = [
-                {'CidrIp': cidr, 'Description': REMEDIATION_DESCRIPTION}
+                {'CidrIp': cidr, 'Description': rule_description}
             ]
         new_ip_permissions.append(permission)
 
@@ -317,7 +306,7 @@ def ec2_sg_remediate_update(ec2_client: boto3.client, sg_id: str, rule: Dict[str
         logger.error("SG %s: FAILED to authorize new rules: %s", sg_id, error_msg)
         return f"FAILED: {error_msg}"
 
-@dry_run_wrapper
+
 def ec2_sg_remediate_revoke(sg_id: str, rule: Dict[str, Any]) -> str:
     """
     Handles the REVOKE remediation action: sends an SNS alert after revocation.
@@ -400,13 +389,17 @@ def ec2_sg_handle_remediation(ec2_client: boto3.client, sg_id: str) -> str:
 
     return f"COMPLETED: {'; '.join(results)}"
 
+
 #########################################
 #         INVOKING FUNCTIONS           #
 #########################################
-def lambda_handler(event, context):  #pylint: disable=unused-argument
+def lambda_handler(event, context):
     """
-    Central dispatcher for Security Hub remediation
+    Central dispatcher for Security Hub remediation, called by AWS Lambda
     """
+
+    logger.debug("LAMBDA_EVENT: '%s'", event)
+    logger.debug("LAMBDA_CONTEXT: '%s'", context)
 
     control_id, sg_id, region = get_details_from_finding(event)
 
@@ -432,3 +425,77 @@ def lambda_handler(event, context):  #pylint: disable=unused-argument
 
     logger.info("Finding %s is not configured for remediation in this Lambda.", control_id)
     return {'statusCode': 200, 'body': 'Finding control ID not handled by this function.'}
+
+
+def main():
+    """
+    Main entry point for CLI invocation.  Assumes AWS Default profile authenticated with correct role for CLI
+    """
+    parser = argparse.ArgumentParser(
+        description="Run the Security Hub Lambda handler logic locally for testing."
+    )
+    # 1. Positional argument made OPTIONAL using nargs='?'
+    parser.add_argument(
+        'sg_id',
+        type=str,
+        nargs='?',
+        default=None,
+        help='The Security Group ID (e.g., sg-0abcdef1234567890)'
+    )
+    parser.add_argument(
+        'region',
+        type=str,
+        nargs='?',
+        default='us-gov-west-1',
+        help='The AWS region (default: us-gov-west-1)'
+    )
+    parser.add_argument(
+        '--control',
+        type=str,
+        default='EC2.19',
+        help='The Security Hub Control ID to simulate (e.g., EC2.19)'
+    )
+    parser.add_argument(
+        '--action',
+        type=str,
+        default='UPDATE',
+        choices=['UPDATE', 'DELETE', 'SKIP'],
+        help='Simulate the Terraform EC2_19_REMEDIATION_ACTION variable (default: UPDATE)'
+    )
+    args = parser.parse_args()
+
+    # CLI Identity Check
+    get_aws_identity()
+
+    if args.control == 'EC2.19' and args.sg_id is None:
+        sys.stderr.write(
+            "Error: The 'sg_id' argument is required when '--control' is set to 'EC2.19'.\n"
+        )
+        sys.exit(1)
+    elif args.control == 'EC2.19':
+        # Mock  SecurityHub FAILED event structure for lambda_handler
+        mock_event = {
+            'detail': {
+                'findings': [{
+                    'Compliance': {'SecurityControlId': args.control},
+                    'Resources': [{
+                        'Details': {'AwsEc2SecurityGroup': {'GroupId': {args.sg_id}}},
+                        'Region': args.region
+                    }]
+                }]
+            }
+        }
+    else:
+        mock_event = {}
+
+    # Call Lambda handler with  mock event (context is None for CLI)
+    response = lambda_handler(mock_event, None)
+
+    # Output
+    print("\n---- Result ----")
+    print(json.dumps(response, indent=2))
+    print("----------------\n")
+
+
+if __name__ == "__main__":
+    main()
