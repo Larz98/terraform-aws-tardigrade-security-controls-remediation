@@ -11,7 +11,7 @@ variable "sns_notification_email" {
   }
 }
 
-variable "lambda_debug" {
+variable "debug" {
   description = "If true, increases logging verbosity from INFO to DEBUG"
   type        = bool
   default     = false
